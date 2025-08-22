@@ -5,8 +5,7 @@ pipeline {
   environment {
     IMAGE_API = 'biblioflow-api:ci'
     API_PORT  = '3003'
-COMPOSE = 'docker run --rm -v $PWD:/wrk -w /wrk -v /var/run/docker.sock:/var/run/docker.sock docker/compose:1.29.2'
-    PROJECT   = 'biblio-api-ci'
+    NET       = 'biblio-api-ci-net'
   }
 
   stages {
@@ -18,79 +17,58 @@ COMPOSE = 'docker run --rm -v $PWD:/wrk -w /wrk -v /var/run/docker.sock:/var/run
       steps { sh 'docker build -t ${IMAGE_API} .' }
     }
 
-    stage('Write CI files') {
+    stage('Bring up stack (no compose)') {
       steps {
         sh '''
-          mkdir -p ci
+          set -e
 
-          # Compose file (no mounts, just images)
-          cat > ci/compose.yml <<'YAML'
-services:
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_USER: test
-      POSTGRES_PASSWORD: test
-      POSTGRES_DB: testdb
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U test -d testdb"]
-      interval: 3s
-      timeout: 3s
-      retries: 20
+          # Clean old stuff
+          docker rm -f ci_api ci_postgres ci_mongo >/dev/null 2>&1 || true
+          docker network rm ${NET} >/dev/null 2>&1 || true
+          docker network create ${NET}
 
-  mongo:
-    image: mongo:7
-    command: ["--auth"]
-    environment:
-      MONGO_INITDB_ROOT_USERNAME: root
-      MONGO_INITDB_ROOT_PASSWORD: rootpw
-      MONGO_INITDB_DATABASE: testdb
-    healthcheck:
-      test: ["CMD-SHELL", "mongosh --quiet -u root -p rootpw --authenticationDatabase admin --eval 'db.adminCommand({ping:1}).ok' | grep 1"]
-      interval: 3s
-      timeout: 3s
-      retries: 20
+          # Postgres
+          docker run -d --name ci_postgres --network ${NET} \
+            -e POSTGRES_USER=test -e POSTGRES_PASSWORD=test -e POSTGRES_DB=testdb \
+            postgres:16-alpine
 
-  api:
-    image: ${IMAGE_API}
-    environment:
-      PORT: 3000
-      DATABASE_URL: postgres://test:test@postgres:5432/testdb
-      MONGODB_URL: mongodb://root:rootpw@mongo:27017/testdb?authSource=admin
-    depends_on:
-      postgres:
-        condition: service_healthy
-      mongo:
-        condition: service_healthy
-YAML
+          # Wait for Postgres
+          for i in $(seq 1 30); do
+            if docker exec ci_postgres pg_isready -U test -d testdb >/dev/null 2>&1; then
+              echo "Postgres is ready"; break
+            fi
+            echo "Waiting for Postgres... ($i)"; sleep 1
+          done
 
-          # CI override: expose ports on host
-          cat > ci/compose.ci.yml <<'YAML'
-services:
-  api:
-    ports:
-      - "${API_PORT}:3000"
-YAML
+          # Mongo (with auth)
+          docker run -d --name ci_mongo --network ${NET} \
+            -e MONGO_INITDB_ROOT_USERNAME=root \
+            -e MONGO_INITDB_ROOT_PASSWORD=rootpw \
+            -e MONGO_INITDB_DATABASE=testdb \
+            mongo:7 --auth
+
+          # Wait for Mongo
+          for i in $(seq 1 30); do
+            if docker exec ci_mongo sh -lc "mongosh --quiet -u root -p rootpw --authenticationDatabase admin --eval 'db.adminCommand({ping:1}).ok' | grep -q 1"; then
+              echo "Mongo is ready"; break
+            fi
+            echo "Waiting for Mongo... ($i)"; sleep 1
+          done
+
+          # API
+          docker run -d --name ci_api --network ${NET} -p ${API_PORT}:3000 \
+            -e PORT=3000 \
+            -e DATABASE_URL=postgres://test:test@ci_postgres:5432/testdb \
+            -e MONGODB_URL='mongodb://root:rootpw@ci_mongo:27017/testdb?authSource=admin' \
+            ${IMAGE_API}
         '''
       }
     }
-
-    stage('Compose up') {
-      steps {
-        sh '''
-          DOCKER_COMPOSE='docker run --rm -v "$(pwd)":/wrk -w /wrk -v /var/run/docker.sock:/var/run/docker.sock docker/compose:1.29.2'
-
-          $DOCKER_COMPOSE -p ${PROJECT} down -v || true
-          $DOCKER_COMPOSE -p ${PROJECT} -f ci/compose.yml -f ci/compose.ci.yml up -d --force-recreate --remove-orphans
-        '''
-      }
-    }
-
 
     stage('Smoke Test') {
       steps {
         sh '''
-          # wait for API to listen on the host-mapped port
+          # Wait for API port to open on the host mapping
           for i in $(seq 1 30); do
             if curl -sS http://host.docker.internal:${API_PORT}/books >/dev/null 2>&1; then
               echo "API is up"; break
@@ -98,7 +76,7 @@ YAML
             echo "Waiting for API... ($i)"; sleep 1
           done
 
-          # Create a book then list
+          # Create a book and list
           curl -sS -X POST http://host.docker.internal:${API_PORT}/books \
                -H "Content-Type: application/json" \
                -d '{"title":"CI Build","author":"Jenkins"}' >/dev/null
@@ -112,12 +90,16 @@ YAML
   post {
     always {
       sh '''
-        DOCKER_COMPOSE='docker run --rm -v "$(pwd)":/wrk -w /wrk -v /var/run/docker.sock:/var/run/docker.sock docker/compose:1.29.2'
-        $DOCKER_COMPOSE -p ${PROJECT} logs --no-color > compose-ci.log 2>&1 || true
-        $DOCKER_COMPOSE -p ${PROJECT} down || true
+        # Collect logs
+        docker logs ci_api    > api.log    2>&1 || true
+        docker logs ci_postgres > postgres.log 2>&1 || true
+        docker logs ci_mongo  > mongo.log  2>&1 || true
+
+        # Teardown
+        docker rm -f ci_api ci_postgres ci_mongo >/dev/null 2>&1 || true
+        docker network rm ${NET} >/dev/null 2>&1 || true
       '''
-      archiveArtifacts artifacts: 'compose-ci.log, api_output.json', allowEmptyArchive: true
+      archiveArtifacts artifacts: 'api_output.json, *.log', allowEmptyArchive: true
     }
   }
-
 }
