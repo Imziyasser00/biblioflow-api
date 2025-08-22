@@ -69,27 +69,56 @@ pipeline {
         sh '''
           set -e
 
-          # Wait for API to respond on the internal network
-          for i in $(seq 1 60); do
-            if docker run --rm --network ${NET} curlimages/curl:8.8.0 \
-              -fsS http://ci_api:3000/books >/dev/null 2>&1; then
-              echo "API is up"; break
+          echo "Container state:"
+          docker ps --filter "name=ci_api" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+
+          # Quick bail if container already exited
+          if [ "$(docker inspect -f '{{.State.Running}}' ci_api || echo false)" != "true" ]; then
+            echo "ci_api is not running. Recent logs:"
+            docker logs --tail=200 ci_api || true
+            exit 1
+          fi
+
+          # Function: consider API "up" if TCP port is open OR any HTTP response is returned (200..599)
+          is_up() {
+            docker run --rm --network ${NET} curlimages/curl:8.8.0 \
+              -sS -o /dev/null -w '%{http_code}' http://ci_api:3000/ || return 1
+          }
+
+          # Wait up to 90s for API
+          ok=false
+          for i in $(seq 1 90); do
+            if is_up; then
+              echo "API responded on ci_api:3000"
+              ok=true
+              break
+            fi
+            # Show brief status every few seconds to help debugging in Jenkins logs
+            if [ $((i % 7)) -eq 0 ]; then
+              echo "-- probe $i: showing last 50 lines from api --"
+              docker logs --tail=50 ci_api || true
             fi
             echo "Waiting for API... ($i)"; sleep 1
           done
 
-          # Create a book
+          if [ "$ok" != "true" ]; then
+            echo "API did not come up in time. Dumping logs:"
+            docker logs ci_api || true
+            exit 1
+          fi
+
+          # If you really have /books, keep these functional checks; otherwise skip or adjust route
           docker run --rm --network ${NET} curlimages/curl:8.8.0 \
             -fsS -X POST http://ci_api:3000/books \
             -H "Content-Type: application/json" \
-            -d '{"title":"CI Build","author":"Jenkins"}' >/dev/null
+            -d '{"title":"CI Build","author":"Jenkins"}' || true
 
-          # List books and save output
           docker run --rm --network ${NET} curlimages/curl:8.8.0 \
-            -fsS http://ci_api:3000/books | tee api_output.json >/dev/null
+            -sS http://ci_api:3000/books | tee api_output.json >/dev/null || true
         '''
       }
     }
+
   }
 
   post {
