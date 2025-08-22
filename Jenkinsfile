@@ -4,7 +4,7 @@ pipeline {
 
   environment {
     IMAGE_API = 'biblioflow-api:ci'
-    API_PORT  = '3003'                      
+    API_PORT  = '3003'
 COMPOSE = 'docker run --rm -v $PWD:/wrk -w /wrk -v /var/run/docker.sock:/var/run/docker.sock docker/compose:1.29.2'
     PROJECT   = 'biblio-api-ci'
   }
@@ -78,11 +78,14 @@ YAML
     stage('Compose up') {
       steps {
         sh '''
-          ${COMPOSE} -p ${PROJECT} down -v || true
-          ${COMPOSE} -p ${PROJECT} -f ci/compose.yml -f ci/compose.ci.yml up -d --force-recreate --remove-orphans
+          DOCKER_COMPOSE='docker run --rm -v "$(pwd)":/wrk -w /wrk -v /var/run/docker.sock:/var/run/docker.sock docker/compose:1.29.2'
+
+          $DOCKER_COMPOSE -p ${PROJECT} down -v || true
+          $DOCKER_COMPOSE -p ${PROJECT} -f ci/compose.yml -f ci/compose.ci.yml up -d --force-recreate --remove-orphans
         '''
       }
     }
+
 
     stage('Smoke Test') {
       steps {
@@ -109,10 +112,12 @@ YAML
   post {
     always {
       sh '''
-        ${COMPOSE} -p ${PROJECT} logs --no-color > compose-ci.log 2>&1 || true
-        ${COMPOSE} -p ${PROJECT} down || true
+        DOCKER_COMPOSE='docker run --rm -v "$(pwd)":/wrk -w /wrk -v /var/run/docker.sock:/var/run/docker.sock docker/compose:1.29.2'
+        $DOCKER_COMPOSE -p ${PROJECT} logs --no-color > compose-ci.log 2>&1 || true
+        $DOCKER_COMPOSE -p ${PROJECT} down || true
       '''
       archiveArtifacts artifacts: 'compose-ci.log, api_output.json', allowEmptyArchive: true
     }
   }
+
 }
