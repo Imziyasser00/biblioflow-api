@@ -4,7 +4,6 @@ pipeline {
 
   environment {
     IMAGE_API = 'biblioflow-api:ci'
-    API_PORT  = '3003'
     NET       = 'biblio-api-ci-net'
   }
 
@@ -17,7 +16,7 @@ pipeline {
       steps { sh 'docker build -t ${IMAGE_API} .' }
     }
 
-    stage('Bring up stack (no compose)') {
+    stage('Bring up stack (isolated net, no host publish)') {
       steps {
         sh '''
           set -e
@@ -33,7 +32,7 @@ pipeline {
             postgres:16-alpine
 
           # Wait for Postgres
-          for i in $(seq 1 30); do
+          for i in $(seq 1 60); do
             if docker exec ci_postgres pg_isready -U test -d testdb >/dev/null 2>&1; then
               echo "Postgres is ready"; break
             fi
@@ -47,16 +46,16 @@ pipeline {
             -e MONGO_INITDB_DATABASE=testdb \
             mongo:7 --auth
 
-          # Wait for Mongo
-          for i in $(seq 1 30); do
+          # Wait for Mongo to accept auth (first seconds can give "Authentication failed")
+          for i in $(seq 1 90); do
             if docker exec ci_mongo sh -lc "mongosh --quiet -u root -p rootpw --authenticationDatabase admin --eval 'db.adminCommand({ping:1}).ok' | grep -q 1"; then
               echo "Mongo is ready"; break
             fi
             echo "Waiting for Mongo... ($i)"; sleep 1
           done
 
-          # API
-          docker run -d --name ci_api --network ${NET} -p ${API_PORT}:3000 \
+          # API (NO host port publishing)
+          docker run -d --name ci_api --network ${NET} \
             -e PORT=3000 \
             -e DATABASE_URL=postgres://test:test@ci_postgres:5432/testdb \
             -e MONGODB_URL='mongodb://root:rootpw@ci_mongo:27017/testdb?authSource=admin' \
@@ -65,23 +64,29 @@ pipeline {
       }
     }
 
-    stage('Smoke Test') {
+    stage('Smoke Test (inside network)') {
       steps {
         sh '''
-          # Wait for API port to open on the host mapping
-          for i in $(seq 1 30); do
-            if curl -sS http://host.docker.internal:${API_PORT}/books >/dev/null 2>&1; then
+          set -e
+
+          # Wait for API to respond on the internal network
+          for i in $(seq 1 60); do
+            if docker run --rm --network ${NET} curlimages/curl:8.8.0 \
+              -fsS http://ci_api:3000/books >/dev/null 2>&1; then
               echo "API is up"; break
             fi
             echo "Waiting for API... ($i)"; sleep 1
           done
 
-          # Create a book and list
-          curl -sS -X POST http://host.docker.internal:${API_PORT}/books \
-               -H "Content-Type: application/json" \
-               -d '{"title":"CI Build","author":"Jenkins"}' >/dev/null
+          # Create a book
+          docker run --rm --network ${NET} curlimages/curl:8.8.0 \
+            -fsS -X POST http://ci_api:3000/books \
+            -H "Content-Type: application/json" \
+            -d '{"title":"CI Build","author":"Jenkins"}' >/dev/null
 
-          curl -sSf http://host.docker.internal:${API_PORT}/books | tee api_output.json >/dev/null
+          # List books and save output
+          docker run --rm --network ${NET} curlimages/curl:8.8.0 \
+            -fsS http://ci_api:3000/books | tee api_output.json >/dev/null
         '''
       }
     }
@@ -91,9 +96,9 @@ pipeline {
     always {
       sh '''
         # Collect logs
-        docker logs ci_api    > api.log    2>&1 || true
-        docker logs ci_postgres > postgres.log 2>&1 || true
-        docker logs ci_mongo  > mongo.log  2>&1 || true
+        docker logs ci_api       > api.log       2>&1 || true
+        docker logs ci_postgres  > postgres.log  2>&1 || true
+        docker logs ci_mongo     > mongo.log     2>&1 || true
 
         # Teardown
         docker rm -f ci_api ci_postgres ci_mongo >/dev/null 2>&1 || true
