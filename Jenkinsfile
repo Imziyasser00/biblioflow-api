@@ -5,12 +5,63 @@ pipeline {
   environment {
     IMAGE_API = 'biblioflow-api:ci'
     NET       = 'biblio-api-ci-net'
+    // Name must match what you configured in Manage Jenkins → System → SonarQube servers
+    SONARQUBE_NAME = 'sonarqube'
   }
 
   stages {
     stage('Checkout') {
       steps { checkout scm }
     }
+
+    // ---- TP11 additions: install, test, sonar ----
+    stage('Install deps') {
+      steps {
+        sh 'npm ci'
+      }
+    }
+
+    stage('Unit tests + coverage') {
+      steps {
+        sh '''
+          set -e
+          npm run test:ci || true
+          # Make sure coverage/lcov.info exists, even if no tests yet
+          test -f coverage/lcov.info || { mkdir -p coverage && touch coverage/lcov.info; }
+        '''
+      }
+      post {
+        always {
+          archiveArtifacts artifacts: 'coverage/**', allowEmptyArchive: true
+        }
+      }
+    }
+
+    stage('SonarQube Analysis') {
+      steps {
+        // Works whether you installed the global scanner tool or not:
+        // - If Jenkins has the SonarQube server configured, env + webhook get set up.
+        withSonarQubeEnv("${env.SONARQUBE_NAME}") {
+          sh '''
+            # Prefer local scanner via npx so the job is self-contained
+            npx --yes sonar-scanner \
+              -Dsonar.projectKey=biblioflow-api \
+              -Dsonar.sources=src \
+              -Dsonar.exclusions=**/node_modules/**,**/dist/** \
+              -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
+          '''
+        }
+      }
+    }
+
+    stage('Quality Gate') {
+      steps {
+        timeout(time: 10, unit: 'MINUTES') {
+          waitForQualityGate abortPipeline: true
+        }
+      }
+    }
+    // ---- end TP11 additions ----
 
     stage('Build API Image') {
       steps { sh 'docker build -t ${IMAGE_API} .' }
@@ -46,7 +97,7 @@ pipeline {
             -e MONGO_INITDB_DATABASE=testdb \
             mongo:7 --auth
 
-          # Wait for Mongo to accept auth (first seconds can give "Authentication failed")
+          # Wait for Mongo to accept auth
           for i in $(seq 1 90); do
             if docker exec ci_mongo sh -lc "mongosh --quiet -u root -p rootpw --authenticationDatabase admin --eval 'db.adminCommand({ping:1}).ok' | grep -q 1"; then
               echo "Mongo is ready"; break
@@ -72,20 +123,17 @@ pipeline {
           echo "Container state:"
           docker ps --filter "name=ci_api" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 
-          # Quick bail if container already exited
           if [ "$(docker inspect -f '{{.State.Running}}' ci_api || echo false)" != "true" ]; then
             echo "ci_api is not running. Recent logs:"
             docker logs --tail=200 ci_api || true
             exit 1
           fi
 
-          # Function: consider API "up" if TCP port is open OR any HTTP response is returned (200..599)
           is_up() {
             docker run --rm --network ${NET} curlimages/curl:8.8.0 \
               -sS -o /dev/null -w '%{http_code}' http://ci_api:3000/ || return 1
           }
 
-          # Wait up to 90s for API
           ok=false
           for i in $(seq 1 90); do
             if is_up; then
@@ -93,7 +141,6 @@ pipeline {
               ok=true
               break
             fi
-            # Show brief status every few seconds to help debugging in Jenkins logs
             if [ $((i % 7)) -eq 0 ]; then
               echo "-- probe $i: showing last 50 lines from api --"
               docker logs --tail=50 ci_api || true
@@ -107,7 +154,7 @@ pipeline {
             exit 1
           fi
 
-          # If you really have /books, keep these functional checks; otherwise skip or adjust route
+          # Optional functional checks:
           docker run --rm --network ${NET} curlimages/curl:8.8.0 \
             -fsS -X POST http://ci_api:3000/books \
             -H "Content-Type: application/json" \
@@ -118,7 +165,6 @@ pipeline {
         '''
       }
     }
-
   }
 
   post {
