@@ -4,8 +4,8 @@ pipeline {
 
   environment {
     IMAGE_API = 'biblioflow-api:ci'
-    API_PORT  = '3003'                      // host port to expose API on
-    COMPOSE   = 'docker run --rm -v $PWD:/wrk -w /wrk -v /var/run/docker.sock:/var/run/docker.sock docker/compose:2.29.2'
+    API_PORT  = '3003'                      
+COMPOSE = 'docker run --rm -v $PWD:/wrk -w /wrk -v /var/run/docker.sock:/var/run/docker.sock docker/compose:1.29.2'
     PROJECT   = 'biblio-api-ci'
   }
 
